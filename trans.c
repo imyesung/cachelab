@@ -22,6 +22,120 @@ int is_transpose(int M, int N, int A[N][M], int B[M][N]);
 char transpose_submit_desc[] = "Transpose submission";
 void transpose_submit(int M, int N, int A[N][M], int B[M][N])
 {
+    int i, j, k, l;
+    int a0, a1, a2, a3, a4, a5, a6, a7;
+
+    /*
+     * 32x32: an 8-int row is exactly one 32-byte cache block.  Read the
+     * whole row into scalars before touching B, so an A/B set conflict
+     * cannot evict a partly consumed A block.
+     */
+    if (M == 32 && N == 32) {
+        for (i = 0; i < N; i += 8) {
+            for (j = 0; j < M; j += 8) {
+                for (k = i; k < i + 8; k++) {
+                    a0 = A[k][j];
+                    a1 = A[k][j + 1];
+                    a2 = A[k][j + 2];
+                    a3 = A[k][j + 3];
+                    a4 = A[k][j + 4];
+                    a5 = A[k][j + 5];
+                    a6 = A[k][j + 6];
+                    a7 = A[k][j + 7];
+
+                    B[j][k] = a0;
+                    B[j + 1][k] = a1;
+                    B[j + 2][k] = a2;
+                    B[j + 3][k] = a3;
+                    B[j + 4][k] = a4;
+                    B[j + 5][k] = a5;
+                    B[j + 6][k] = a6;
+                    B[j + 7][k] = a7;
+                }
+            }
+        }
+        return;
+    }
+
+    /*
+     * 64x64: rows four apart map to the same cache sets.  Keep an 8x8
+     * outer tile for full block use, but move it as 4x4 quadrants.  The
+     * unused half of B temporarily holds the top-right quadrant while
+     * it is swapped with the bottom-left quadrant.
+     */
+    if (M == 64 && N == 64) {
+        for (i = 0; i < N; i += 8) {
+            for (j = 0; j < M; j += 8) {
+                for (k = i; k < i + 4; k++) {
+                    a0 = A[k][j];
+                    a1 = A[k][j + 1];
+                    a2 = A[k][j + 2];
+                    a3 = A[k][j + 3];
+                    a4 = A[k][j + 4];
+                    a5 = A[k][j + 5];
+                    a6 = A[k][j + 6];
+                    a7 = A[k][j + 7];
+
+                    B[j][k] = a0;
+                    B[j + 1][k] = a1;
+                    B[j + 2][k] = a2;
+                    B[j + 3][k] = a3;
+                    B[j][k + 4] = a4;
+                    B[j + 1][k + 4] = a5;
+                    B[j + 2][k + 4] = a6;
+                    B[j + 3][k + 4] = a7;
+                }
+
+                for (k = j; k < j + 4; k++) {
+                    a0 = B[k][i + 4];
+                    a1 = B[k][i + 5];
+                    a2 = B[k][i + 6];
+                    a3 = B[k][i + 7];
+                    a4 = A[i + 4][k];
+                    a5 = A[i + 5][k];
+                    a6 = A[i + 6][k];
+                    a7 = A[i + 7][k];
+
+                    B[k][i + 4] = a4;
+                    B[k][i + 5] = a5;
+                    B[k][i + 6] = a6;
+                    B[k][i + 7] = a7;
+                    B[k + 4][i] = a0;
+                    B[k + 4][i + 1] = a1;
+                    B[k + 4][i + 2] = a2;
+                    B[k + 4][i + 3] = a3;
+                }
+
+                for (k = i + 4; k < i + 8; k++) {
+                    a0 = A[k][j + 4];
+                    a1 = A[k][j + 5];
+                    a2 = A[k][j + 6];
+                    a3 = A[k][j + 7];
+
+                    B[j + 4][k] = a0;
+                    B[j + 5][k] = a1;
+                    B[j + 6][k] = a2;
+                    B[j + 7][k] = a3;
+                }
+            }
+        }
+        return;
+    }
+
+    /*
+     * 61x67 (and any other size): irregular row strides already break
+     * up the worst set conflicts.  A 23x23 clipped tile gives locality
+     * while the two bounds handle the partial tiles at the edges.
+     */
+    for (i = 0; i < N; i += 23) {
+        for (j = 0; j < M; j += 23) {
+            for (k = i; k < i + 23 && k < N; k++) {
+                for (l = j; l < j + 23 && l < M; l++) {
+                    B[l][k] = A[k][l];
+                }
+            }
+        }
+    }
 }
 
 /* 
@@ -81,4 +195,3 @@ int is_transpose(int M, int N, int A[N][M], int B[M][N])
     }
     return 1;
 }
-
