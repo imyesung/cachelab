@@ -26,14 +26,21 @@ void transpose_submit(int M, int N, int A[N][M], int B[M][N])
     int a0, a1, a2, a3, a4, a5, a6, a7;
 
     /*
-     * 32x32: an 8-int row is exactly one 32-byte cache block.  Read the
-     * whole row into scalars before touching B, so an A/B set conflict
-     * cannot evict a partly consumed A block.
+     * 32x32: 8x8 blocking + register buffering.
+     *
+     * One row = 32 ints = 128B = 4 cache blocks.  An 8-int segment
+     * fits exactly in one 32-byte cache block.
+     *
+     * Strategy: read an entire 8-element row of A into local vars
+     * (a0-a7) BEFORE writing to B.  This way, even if writing to B
+     * evicts A's cache line (diagonal blocks where A and B map to the
+     * same set), we already have A's values in registers.
      */
     if (M == 32 && N == 32) {
-        for (i = 0; i < N; i += 8) {
-            for (j = 0; j < M; j += 8) {
+        for (i = 0; i < N; i += 8) {          /* tile rows */
+            for (j = 0; j < M; j += 8) {      /* tile cols */
                 for (k = i; k < i + 8; k++) {
+                    /* load full row from A into registers */
                     a0 = A[k][j];
                     a1 = A[k][j + 1];
                     a2 = A[k][j + 2];
@@ -43,6 +50,7 @@ void transpose_submit(int M, int N, int A[N][M], int B[M][N])
                     a6 = A[k][j + 6];
                     a7 = A[k][j + 7];
 
+                    /* store to B -- A is no longer needed from cache */
                     B[j][k] = a0;
                     B[j + 1][k] = a1;
                     B[j + 2][k] = a2;
@@ -58,14 +66,40 @@ void transpose_submit(int M, int N, int A[N][M], int B[M][N])
     }
 
     /*
-     * 64x64: rows four apart map to the same cache sets.  Keep an 8x8
-     * outer tile for full block use, but move it as 4x4 quadrants.  The
-     * unused half of B temporarily holds the top-right quadrant while
-     * it is swapped with the bottom-left quadrant.
+     * 64x64: 8x8 blocking split into 4x4 quadrants + B as temp storage.
+     *
+     * Problem: row stride = 64*4 = 256B = 8 cache blocks.  The cache
+     * has 32 sets, so rows 4 apart map to the SAME cache set.  With
+     * direct-mapped (E=1), row 0 and row 4 cannot coexist -- one
+     * always evicts the other.  Naive 8x8 blocking causes miss storms.
+     *
+     * Solution: process each 8x8 tile in three phases, never touching
+     * more than 4 rows of the same array at once.
+     *
+     * Quadrant layout of one 8x8 tile:
+     *
+     *   A (source)          B (destination, transposed)
+     *   ┌──────┬──────┐     ┌──────┬──────┐
+     *   │ A_TL │ A_TR │     │ B_TL │ B_TR │
+     *   ├──────┼──────┤     ├──────┼──────┤
+     *   │ A_BL │ A_BR │     │ B_BL │ B_BR │
+     *   └──────┴──────┘     └──────┴──────┘
+     *
+     *   Correct transpose mapping:
+     *     A_TL^T → B_TL    A_TR^T → B_BL
+     *     A_BL^T → B_TR    A_BR^T → B_BR
      */
     if (M == 64 && N == 64) {
-        for (i = 0; i < N; i += 8) {
-            for (j = 0; j < M; j += 8) {
+        for (i = 0; i < N; i += 8) {          /* tile rows */
+            for (j = 0; j < M; j += 8) {      /* tile cols */
+
+                /*
+                 * Phase 1: read A's top 4 rows (A_TL and A_TR).
+                 *   - A_TL^T goes to B_TL (correct final position).
+                 *   - A_TR^T goes to B_TR as TEMPORARY storage.
+                 *     (It belongs in B_BL, but we can't write there
+                 *      yet without causing set conflicts with B_TL.)
+                 */
                 for (k = i; k < i + 4; k++) {
                     a0 = A[k][j];
                     a1 = A[k][j + 1];
@@ -76,21 +110,36 @@ void transpose_submit(int M, int N, int A[N][M], int B[M][N])
                     a6 = A[k][j + 6];
                     a7 = A[k][j + 7];
 
+                    /* A_TL^T → B_TL (final position) */
                     B[j][k] = a0;
                     B[j + 1][k] = a1;
                     B[j + 2][k] = a2;
                     B[j + 3][k] = a3;
+
+                    /* A_TR^T → B_TR (TEMPORARY -- will be moved later) */
                     B[j][k + 4] = a4;
                     B[j + 1][k + 4] = a5;
                     B[j + 2][k + 4] = a6;
                     B[j + 3][k + 4] = a7;
                 }
 
+                /*
+                 * Phase 2: swap B_TR temp values with A_BL, in the
+                 * same loop to reuse B's cache lines while they're hot.
+                 *
+                 * For each column k of B's top 4 rows:
+                 *   1. Read B_TR temp values (A_TR^T) into registers
+                 *   2. Read A_BL column and write A_BL^T → B_TR (final)
+                 *   3. Write the saved A_TR^T values → B_BL (final)
+                 */
                 for (k = j; k < j + 4; k++) {
+                    /* save temp values from B_TR */
                     a0 = B[k][i + 4];
                     a1 = B[k][i + 5];
                     a2 = B[k][i + 6];
                     a3 = B[k][i + 7];
+
+                    /* A_BL^T → B_TR (final position) */
                     a4 = A[i + 4][k];
                     a5 = A[i + 5][k];
                     a6 = A[i + 6][k];
@@ -100,12 +149,18 @@ void transpose_submit(int M, int N, int A[N][M], int B[M][N])
                     B[k][i + 5] = a5;
                     B[k][i + 6] = a6;
                     B[k][i + 7] = a7;
+
+                    /* saved A_TR^T → B_BL (final position) */
                     B[k + 4][i] = a0;
                     B[k + 4][i + 1] = a1;
                     B[k + 4][i + 2] = a2;
                     B[k + 4][i + 3] = a3;
                 }
 
+                /*
+                 * Phase 3: A_BR^T → B_BR (final position).
+                 * Straightforward -- no conflict issues here.
+                 */
                 for (k = i + 4; k < i + 8; k++) {
                     a0 = A[k][j + 4];
                     a1 = A[k][j + 5];
@@ -123,9 +178,15 @@ void transpose_submit(int M, int N, int A[N][M], int B[M][N])
     }
 
     /*
-     * 61x67 (and any other size): irregular row strides already break
-     * up the worst set conflicts.  A 23x23 clipped tile gives locality
-     * while the two bounds handle the partial tiles at the edges.
+     * 61x67 (and any other size): simple 23x23 blocking.
+     *
+     * Row stride = 61*4 = 244B, which is NOT a power of two, so rows
+     * don't align to the same cache sets as neatly as 32x32 or 64x64.
+     * The conflict pattern is naturally spread out, so a simple tile
+     * without register tricks is enough.
+     *
+     * 23 works well because it's coprime with 32 (the number of cache
+     * sets), further reducing set conflicts across tile boundaries.
      */
     for (i = 0; i < N; i += 23) {
         for (j = 0; j < M; j += 23) {
